@@ -1,4 +1,3 @@
-
 function randomInput(model::Model,n::Int)
 	return rand(model.n0,n)
 end

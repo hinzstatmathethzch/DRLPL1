@@ -1,201 +1,354 @@
 include("../models/random.jl")
-include("../models/L1DataModel.jl")
-include("./solverLP.jl")
+include("util/helpers.jl")
 
-
-randmodel=randomModel(4,[5,4,2])
-n=500
-# input parameters
-Ydata=rand(Uniform(-3,3),n)
-Xdata=rand(Uniform(-3,3),randmodel.n0,n)
-
-include("../models/L1DataModel.jl")
-include("./solverLP.jl")
-l=2
-datamodel=L1DataModel(randmodel,Xdata,Ydata,l)
-model=datamodel
-
-x0=rand(Uniform(-20,20),model.n0)
-x=x0
-
-(code,trace1,x)=solverLP(model,x);
-code
-
-##############################
-# analysis for increasing function value
-##############################
-#copy state and trace
-statecopy=deepcopy(first(last(trace1)))
-trace=deepcopy(trace1)
-state=deepcopy(statecopy)
-
-state.x
-maximum(criticalCoordinates(model,state,state.critical))
-differentSignatureCoordinates(model,statecopy)
-setdiff(differentSignaturePositions(model,state),state.critical)
-det(state.Apseudo)
-
-# perform step
-state=deepcopy(statecopy)
-i=bestIndex(state,-state.gradient)
-state.Apseudo=computeAPseudo(model,state)
-state.negModifiedGrad=state.Apseudo[i,:]
-state.Apseudo = PseudoInverseRemoveCol(state.Apseudo,i)
-deleteat!(state.critical,i)
-
-v=state.negModifiedGrad
-(t,change)=advanceMaxAdjustedNew(model,state,v)
-
-(pos,normalvec)=step(model,state)
-
-(s1,g)=sigGrad(model,statecopy.x)
-(s2,_)=sigGrad(model,state.x)
-dot(g,statecopy.Apseudo[i,:])
-
-s1.=statecopy.s
-s2=state.s
-
-
-differentSignatureCoordinates(model,statecopy)
-differentSignatureCoordinates(model,state)
-
-criticalCoordinates(model,statecopy,statecopy.critical)
-criticalCoordinates(model,state,state.critical)
-
-f(model,state.x)
-f(model,statecopy.x)
-
-l=3
-sum(s1[l].==s2[l])
-
-
-v=statecopy.Apseudo[i,:]
-dot(v,statecopy.gradient)
-(t,change)=advanceMaxAdjustedNew(model,state,v)
-x2=statecopy.x+t*v
-f(model,x2)
-
-(s3,_)=sigGrad(model,statecopy.x+0*t*v)
-
-s1[2][8]
-
-sum(s3[2].==s1[2])
-
-s3[2][8]
-# END analysis for increasing function value
-##############################
-
-
-##############################
-# analysis for negative t
-##############################
-(s,g)=sigGrad(model,x0)
-#
-trace=[]
-state=SolverState(model,x0)
-println(f(model,state.x)[1])
-while size(state.critical,1) < model.n0
-	v=state.negModifiedGrad
-	(t,change)=advanceMaxAdjustedNew(model,state,v)
-	println("t=$t")
-	if t<0 
-		println("t<0")
-		break
+function branchReLUArguments(rewrite::ModelRewrite,branch::DataBranch,pos::Array{Float64,1})
+A=Array{Array{Float64,1},1}()
+tmp=branch.W1*pos
+for l = 1:rewrite.L-1
+	tmp+=rewrite.bNeedAdjustEnd[l]
+	push!(A,tmp)
+	tmp=branch.s[l].*tmp
+	tmp=rewrite.W2[l]*tmp
+end
+tmp+=rewrite.bNeedAdjustEnd[rewrite.L]-branch.y
+push!(A,tmp)
+return A
+end
+function criticalCoordinates(state::TrainerState)
+	return Array{Float64,1}([branchReLUArguments(state.rewrite,state.branches[c[1]],state.pos)[c[2]][c[3]] for c in state.critical])
+end
+function coordinateDiff(state::TrainerState)
+	return maximum(abs.( criticalCoordinates(state)))
+end
+function updateTrained!(model::Model,ell::Int,pos::Array{Float64,1})
+	wsize=size(model.W[ell])
+	for i = 1:wsize[1]
+		model.W[ell][i,:]=pos[((i-1)*(wsize[2]+1)+1):((i-1)*(wsize[2]+1)+wsize[2])]
+		model.b[ell][i]=pos[i*(wsize[2]+1)]
 	end
-	(pos,normalvec)=step(model,state)
-	s2=first(sigGrad(model,state.x))
-	println("sum: ",sum(s2[2].==s[2]))
+end
+function changeActivationPattern!(state::TrainerState,pos::Tuple{Int,Int,Int},newActivation::Bool)
+	# changeActivationPattern!(state.rewrite,state.branches[pos[1]],(pos[2],pos[3]),newActivation)
+	# return
+	if state.branches[pos[1]].duplicateRepresentative>0 && pos[2]<state.rewrite.L
+		representative=Int(state.branches[pos[1]].duplicateRepresentative)
+		println("multiple___________________________________________change")
+		for branch=state.branches
+			if branch.duplicateRepresentative==representative
+				changeActivationPattern!(state.rewrite,branch,(pos[2],pos[3]),newActivation)
+			end
+		end
+	else
+		changeActivationPattern!(state.rewrite,state.branches[pos[1]],(pos[2],pos[3]),newActivation)
+	end
+end
+function updateGradient!(state::TrainerState,i::Int)
+	if state.branches[i].duplicateRepresentative>0 
+		representative=Int(state.branches[i].duplicateRepresentative)
+		println("multiple gradients_____________________________________")
+		for branch=state.branches
+			if branch.duplicateRepresentative==representative
+				branch.grad=gradient(state.rewrite,branch)
+			end
+		end
+	else
+		state.branches[i].grad=gradient(state.rewrite,state.branches[i])
+	end
+	state.gradient=sum([branch.grad for branch in state.branches])
+	return state.gradient
+end
+function sigdiffs(state::TrainerState)
+diffs=Array{Tuple{Int,Int,Int},1}()
+assumed=[branch.s for branch in state.branches]
+real=[sigGrad(state.rewrite,branch.W1,branch.y,state.pos)[1] for branch in state.branches]
+for i = 1:length(real)
+r=real[i]
+for l = 1:length(r)
+vals=r[l]
+for j = 1:length(vals)
+if vals[j]!=assumed[i][l][j]
+push!(diffs,(i,l,j))
+end
+end
+end
+end
+return diffs
+end
+function argDiffs(state::TrainerState)
+diffs=sigdiffs(state)
+args=[branchReLUArguments(state.rewrite,branch,state.pos) for branch in state.branches]
+return [args[d[1]][d[2]][d[3]] for d in diffs]
+end
+
+
+
+##############################
+
+
+
+##############################
+
+
+
+
+randmodel=randomModel(4,[5,5,5,5,2])
+model=randmodel
+N=1000
+# input parameters
+Ydata=rand(Uniform(-3,3),N)
+Xdata=rand(Uniform(-3,3),randmodel.n0,N)
+
+ell=1
+state=TrainerState(randmodel,ell,Xdata,Ydata)
+state.gradient
+(code,state,pos)=trainL1(model,ell,Xdata,Ydata);
+
+updateTrained!(model,ell,pos)
+
+#######################
+#
+#
+#
+
+
+grads=[branch.grad for branch in state.branches]
+
+sum(grads)
+
+grads[34]
+
+state
+
+sigdiffs(state)
+adiffs=argDiffs(state)
+state.duplicateGroups
+
+
+state=TrainerState(randmodel,ell,Xdata,Ydata)
+
+i=1
+[state.branches[k].s for k in state.duplicateGroups[i]]
+
+[state.branches[k].W1 for k in state.duplicateGroups[i]]
+[state.branches[k].y for k in state.duplicateGroups[i]]
+
+[branchReLUArguments(state.rewrite,state.branches[k],state.pos) for k in state.duplicateGroups[i]]
+
+state.branches
+
+state.branches[180].s
+state.branches[106].s
+
+state.duplicateGroups
+
+
+index=1
+
+pos=state.critical[index]
+newActivation=!state.branches[pos[1]].s[pos[2]][pos[3]]
+changeActivationPattern!(state,pos,newActivation)
+
+updateGradient!(state,pos[1])
+state.Apseudo=computeAPseudo(state) # TODO: different result, check
+println("diff before: $(coordinateDiff(state))")
+i=bestIndex(state,-state.gradient)
+
+state.negModifiedGrad=state.Apseudo[i,:]
+state.Apseudo= PseudoInverseRemoveCol(state.Apseudo,i)
+removeCritical!(state,i)
+(pos,normalvec,t)=step(state)
+l=loss(state)
+
+
+
+
+
+
+
+
+
+trace=[]
+state=TrainerState(model,ell,Xdata,Ydata)
+##############################
+# findVertex
+##############################
+println( loss(state))
+while size(state.critical,1) < state.rewrite.n0
+	# global trace
+	(pos,normalvec,t)=step(state)
 	if pos[1]<=0
 		#if pos[1]==0 then gradient is zero, 
 		#if pos[1]==-1 then function can be made arbitrarily small
-		return (pos[1],trace,state.x)
-	end
-	push!(trace,(deepcopy(state),deepcopy(normalvec), f(model,state.x)[1]))
-	println(f(model,state.x)[1])
-end
-
-state=deepcopy(first(trace[3]))
-s2=first(sigGrad(model,state.x))
-println("sum: ",sum(s2[2].==s[2]))
-v=state.negModifiedGrad;
-
-(t,change)=advanceMaxAdjustedNew(model,state,v);
-println("t=$t")
-# s2=first(sigGrad(model,state.x+t*v))
-(pos,normalvec)=step(model,state)
-s2=first(sigGrad(model,state.x))
-
-state.critical
-println("sum: ",sum(s2[2].==s[2]))
-
-changes2=(s2[2].!=s[2])
-pos=[(2,j) for j in findall(x->s2[2][x]!=s[2][x],1:model.n[2])]
-
-pos=[(2,j) for j in 1:model.n[2]]
-cc=criticalCoordinates(model,state,pos)
-[(i,cc[i]) for i in 1:size(cc,1)]
-
-
-m=model
-
-
-s=state.s
-x=state.x
-critical=deepcopy(state.critical)
-sort!(critical,lt=sortfunction)
-criticalIdx=1;
-considerCritical=(criticalIdx<=length(critical))
-nextCriticalLayer=0;
-if considerCritical
-	nextCriticalLayer=first(critical[criticalIdx])	
-end
-change=Array{Tuple{Int,Int,Bool,Float64},1}()
-sizehint!(change,10)
-α=m.W[1]*x+m.b[1]
-β=m.W[1]*v
-t=Inf64
-for i = 1:m.L
-global considerCritical,nextCriticalLayer,criticalIdx,t,α,β
-for j = 1:m.n[i]
-if considerCritical
-	if nextCriticalLayer==i
-		if critical[criticalIdx][2]==j
-			println("critical $i,$j")
-			criticalIdx+=1
-			if criticalIdx>length(critical)
-				considerCritical=false
-			else
-				nextCriticalLayer=first(critical[criticalIdx])
-			end
-			continue;
+		if pos[1]==0
+			println("gradient is zero!")
 		end
+		if pos[1]==-1
+			println("can be made arbitrary small!")
+		end
+		return (pos[1],trace,state.pos)
+	end
+	state.Apseudo=computeAPseudo(state)
+	l=loss(state)
+	# println("diff: $(coordinateDiff(state))")
+	push!(trace,(deepcopy(state),deepcopy(normalvec), l))
+	println(l,det(state.Apseudo*state.Apseudo'))
+end;
+
+index=1
+while true
+	global state, index
+pos=state.critical[index]
+newActivation=!state.branches[pos[1]].s[pos[2]][pos[3]]
+changeActivationPattern!(state,pos,newActivation)
+normalvec=orientedNormalVec(state.rewrite,state.branches[pos[1]],(pos[2],pos[3]))
+projected=projectSkip(state, normalvec,index)
+orthogonal=normalvec-projected
+axis=(1/dot(orthogonal,normalvec))* orthogonal
+state.Apseudo[index,:]=axis
+updateGradient!(state,pos[1])
+state.Apseudo=computeAPseudo(state) # TODO: different result, check
+println("diff before: $(coordinateDiff(state))")
+push!(trace,(deepcopy(state),deepcopy(normalvec), loss(state)))
+state=deepcopy(trace[end][1])
+i=bestIndex(state,-state.gradient)
+if i>0
+	state.negModifiedGrad=state.Apseudo[i,:]
+	state.Apseudo= PseudoInverseRemoveCol(state.Apseudo,i)
+	removeCritical!(state,i)
+	(pos,normalvec,t)=step(state)
+	l=loss(state)
+	if t>0 && l[1]>last(last(trace))[1]
+		println("Increases in value!")
+		println(l)
+		return (-2,trace,state.pos) #-2 = increases in function value
+	end
+	if pos[1]<=0 
+		if pos[1]==0
+			println("gradient is zero!")
+		end
+		if pos[1]==-1
+			println("can be made arbitrary small!")
+		end
+		return (pos[1],trace,state.pos) #return information code "pos[1]"
+	end
+	index=1
+	println(loss(state)[1])
+else
+	index+=1
+	if index>state.rewrite.n0
+		println("finished")
+		return(1,trace,state.pos)
+		break;
 	end
 end
-if j>m.nNoDuplicate[i]
-continue;
-end
-if β[j]!=0
-τ=-α[j]/β[j]
-if i==2 &&changes2[j]==true
-	println(τ)
-end
-if ((s[i][j]==true)&&(β[j]<0))||((s[i][j]==false)&&(β[j]>0))
-if τ<=t+1e-10
-if τ<t-1e-10
-empty!(change)
-t=τ
-end
-push!(change,(i,j,(β[j]>0),τ))
-end
-end
-end
-end
-α= m.W[i+1]*(s[i].*α)+m.b[i+1]
-β= m.W[i+1]*(s[i].*β)
 end
 
-return (t,change)
+#######################
+
+function  trainL1(model::Model,ell::Int,Xdata::Matrix,Ydata::Array{Float64,1})
+trace=[]
+prevloss=Inf
+state=TrainerState(model,ell,Xdata,Ydata)
+##############################
+# findVertex
+##############################
+println( loss(state))
+while size(state.critical,1) < state.rewrite.n0
+	# global trace
+	(pos,normalvec,t)=step(state)
+	if pos[1]<=0
+		#if pos[1]==0 then gradient is zero, 
+		#if pos[1]==-1 then function can be made arbitrarily small
+		if pos[1]==0
+			println("gradient is zero!")
+		end
+		if pos[1]==-1
+			println("can be made arbitrary small!")
+		end
+		return (pos[1],state,state.pos)
+	end
+	state.Apseudo=computeAPseudo(state)
+	l=loss(state)
+	prevloss=l
+	# push!(trace,(deepcopy(state),deepcopy(normalvec), l))
+	println(l,det(state.Apseudo*state.Apseudo'))
 end
+##############################
+# change the region
+##############################
+index=1
+while true
+	# global state, index
+pos=state.critical[index]
+#
+newActivation=!state.branches[pos[1]].s[pos[2]][pos[3]]
+changeActivationPattern!(state,pos,newActivation)
+#
+# compute new axis
+normalvec=orientedNormalVec(state.rewrite,state.branches[pos[1]],(pos[2],pos[3]))
+#
+# normalvec=-normalvec #TODO: check!
+projected=projectSkip(state, normalvec,index)
+orthogonal=normalvec-projected
+axis=(1/dot(orthogonal,normalvec))* orthogonal
+state.Apseudo[index,:]=axis
+#
+# compute new gradient
+updateGradient!(state,pos[1])
+##############################
+# select best axis to continue
+##############################
+state.Apseudo=computeAPseudo(state) # TODO: different result, check
+cdiff=coordinateDiff(state)
+if cdiff>1e-8
+	println("coordinate diff: $(cdiff)")
+end
+adiffs=argDiffs(state)
+if length(adiffs)>0
+	adiff=maximum(abs.(adiffs))
+	if adiff>1e-8
+		println("argdiff: $(adiff)")
+	end
+end
+# push!(trace,(deepcopy(state),deepcopy(normalvec), loss(state)))
+# state=deepcopy(trace[end][1])
+i=bestIndex(state,-state.gradient)
+if i>0
+	state.negModifiedGrad=state.Apseudo[i,:]
+	state.Apseudo= PseudoInverseRemoveCol(state.Apseudo,i)
+	removeCritical!(state,i)
+	(pos,normalvec,t)=step(state)
+	l=loss(state)
+	if t>0 && l[1]>prevloss[1]
+		println("Increases in value!")
+		println(l)
+		return (-2,state,state.pos) #-2 = increases in function value
+	end
+	prevloss=l
+	if pos[1]<=0 
+		if pos[1]==0
+			println("gradient is zero!")
+		end
+		if pos[1]==-1
+			println("can be made arbitrary small!")
+		end
+		#if pos[1]==0 then gradient is zero, 
+		#if pos[1]==-1 then function can be made arbitrarily small
+		return (pos[1],state,state.pos) #return information code "pos[1]"
+	end
+	index=1
+	println(loss(state)[1])
+else
+	index+=1
+	if index>state.rewrite.n0
+		println("finished")
+		return(1,state,state.pos)
+		break;
+	end
+end
+end
+end
+
 
 
 
