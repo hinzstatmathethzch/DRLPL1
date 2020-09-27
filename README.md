@@ -1,2 +1,5 @@
 # DRLPL1
-Deep ReLU Programming for L1 loss
+## Description
+This repository contains an implementation of the Deep ReLU Programming algorithm for the iterative layer-wise L1 loss parameter training of deep neural networks.
+## Article
+
