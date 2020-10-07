@@ -32,7 +32,7 @@ struct ModelRewrite
 	nNoDuplicate::Array{Int,1}
 	L::Int
 	W2::Array{Array{Float64,2},1}
-	bNeedAdjustEnd::Array{Array{Float64,1},1}
+	c::Array{Array{Float64,1},1}
 	function ModelRewrite(model::Model, ell::Int)
 		@assert(ell<=model.L+1)
 		@assert(ell>=1)
@@ -47,8 +47,8 @@ struct ModelRewrite
 		L=model.L-ell+2
 		W2=Array{Matrix,1}((model.W[ell+1:end]))
 		nlast=(ell <=model.L ? model.n[ell] : 1)
-		bNeedAdjustEnd=Array{Array{Float64,1},1}([repeat([0],outer=nlast),(model.b[ell+1:end])...])
-		new(n0,n,nNoDuplicate,L,W2,bNeedAdjustEnd)
+		c=Array{Array{Float64,1},1}([repeat([0],outer=nlast),(model.b[ell+1:end])...])
+		new(n0,n,nNoDuplicate,L,W2,c)
 	end
 end
 function sigGrad(m::ModelRewrite,W1::Matrix, y::Array{Float64,1}, pos::Array{Float64,1})
@@ -73,7 +73,7 @@ for l = 1:m.L-1
 	grad=s[l].*(W1*grad)
 	end
 	tmp=ReLU.(tmp)
-	tmp=m.W2[l+1-1]*tmp+m.bNeedAdjustEnd[l+1]
+	tmp=m.W2[l+1-1]*tmp+m.c[l+1]
 end
 #
 # last layer
@@ -132,29 +132,29 @@ mutable struct TrainerState
 	pos::Array{Float64,1} # position for theta_l
 	critical::Array{Tuple{Int,Int,Int},1}
 	gradient::Array{Float64,1}
-	negModifiedGrad::Array{Float64,1}
+	direction::Array{Float64,1}
 	function TrainerState(model::Model,ell::Int,Xdata::Matrix, Ydata::Array{Float64,1})
 		@assert(size(Xdata,2)==size(Ydata,1))
 		@assert(size(Xdata,1)>0)
-	modelRewrite=ModelRewrite(model,ell)
-	rep=(ell<=model.L ? model.n[ell] : 1)
-	outputs=[layerOutput(model,Xdata[:,i],ell-1) for i in 1:size(Xdata,2)]
-	dup=duplicates(outputs)
-	startmatrices=Array{Matrix,1}([constructTMatrix(rep,output) for output in outputs]);
-	pos=tildeParameter(model,ell)
-	branches=[DataBranch(modelRewrite,startmatrices[i],[Ydata[i]],pos) for i in 1:N];
-	for k = 1:length(dup)
-		representative=k
-		for i = dup[k]
-			branches[i].duplicateRepresentative=representative
+		modelRewrite=ModelRewrite(model,ell)
+		rep=(ell<=model.L ? model.n[ell] : 1)
+		outputs=[layerOutput(model,Xdata[:,i],ell-1) for i in 1:size(Xdata,2)]
+		dup=duplicates(outputs)
+		startmatrices=Array{Matrix,1}([constructTMatrix(rep,output) for output in outputs]);
+		pos=tildeParameter(model,ell)
+		branches=[DataBranch(modelRewrite,startmatrices[i],[Ydata[i]],pos) for i in 1:N];
+		for k = 1:length(dup)
+			representative=k
+			for i = dup[k]
+				branches[i].duplicateRepresentative=representative
+			end
 		end
-	end
-	grad=branches[1].grad
-	for i = 2:size(branches,1)
-		grad+=branches[i].grad
-	end
-	critical=Array{Tuple{Int,Int,Int},1}()
-	new(dup,modelRewrite,zeros(0,modelRewrite.n0),branches,pos,critical,grad,-grad)
+		grad=branches[1].grad
+		for i = 2:size(branches,1)
+			grad+=branches[i].grad
+		end
+		critical=Array{Tuple{Int,Int,Int},1}()
+		new(dup,modelRewrite,zeros(0,modelRewrite.n0),branches,pos,critical,grad,-grad)
 	end
 end
 function sortfunction(x,y)
@@ -218,7 +218,7 @@ end
 end
 end
 if l<rewrite.L
-	α = rewrite.W2[l]*(s[l].*α)+rewrite.bNeedAdjustEnd[l+1]
+	α = rewrite.W2[l]*(s[l].*α)+rewrite.c[l+1]
 	β = rewrite.W2[l]*(s[l].*β)
 end
 end
@@ -247,7 +247,7 @@ function branchLoss(rewrite::ModelRewrite,W1::Matrix,y::Array{Float64,1},pos::Ar
 tmp=W1*pos
 for l = 1:rewrite.L-1
 	tmp=ReLU.(tmp)
-	tmp=rewrite.W2[l]*tmp+rewrite.bNeedAdjustEnd[l+1]
+	tmp=rewrite.W2[l]*tmp+rewrite.c[l+1]
 end
 tmp-=y
 if tmp[1]<0
@@ -337,25 +337,25 @@ function project(rewrite::ModelRewrite, state::TrainerState,vec::Array{Float64,1
 	return state.Apseudo' * coordinates
 end
 function step(state::TrainerState)
-	v=state.negModifiedGrad
+	v=state.direction
 	if all(x->abs(x)<1e-10,v)
-		return ((0,0,0),[],0)
+		@warn("Gradient is zero")
 	end
 	rewrite=state.rewrite
 	(i,(t,change))=advanceMaxJoint(state,state.pos,v)
 	if i==0 #no step possible
-		return ((-1,-1,-1),[],0)
+		throw("No region change in selected direction!")
 	end
 	state.pos=state.pos+t*v
 	############################### add critical
-	pos=(i,change[1][1],change[1][2])
-	normalvec=addCritical!(rewrite,state,pos)
+	pos = (i,change[1][1],change[1][2])
+	normalvec = addCritical!(rewrite,state,pos)
 	if size(state.Apseudo,1)<rewrite.n0
 		############################### orthogonalize
-		v=state.negModifiedGrad
-		state.negModifiedGrad=v-project(rewrite,state,v)
+		v=state.direction
+		state.direction=v-project(rewrite,state,v)
 	else
-		state.negModifiedGrad=zeros(rewrite.n0)
+		state.direction=zeros(rewrite.n0)
 	end
 	return (pos,normalvec,t)
 end

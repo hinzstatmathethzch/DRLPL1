@@ -5,12 +5,12 @@ function branchReLUArguments(rewrite::ModelRewrite,branch::DataBranch,pos::Array
 A=Array{Array{Float64,1},1}()
 tmp=branch.W1*pos
 for l = 1:rewrite.L-1
-	tmp+=rewrite.bNeedAdjustEnd[l]
+	tmp+=rewrite.c[l]
 	push!(A,tmp)
 	tmp=branch.s[l].*tmp
 	tmp=rewrite.W2[l]*tmp
 end
-tmp+=rewrite.bNeedAdjustEnd[rewrite.L]-branch.y
+tmp+=rewrite.c[rewrite.L]-branch.y
 push!(A,tmp)
 return A
 end
@@ -28,9 +28,8 @@ function updateTrained!(model::Model,ell::Int,pos::Array{Float64,1})
 	end
 end
 function changeActivationPattern!(state::TrainerState,pos::Tuple{Int,Int,Int},newActivation::Bool)
-	# changeActivationPattern!(state.rewrite,state.branches[pos[1]],(pos[2],pos[3]),newActivation)
-	# return
-	if state.branches[pos[1]].duplicateRepresentative>0 && pos[2]<state.rewrite.L
+	if state.branches[pos[1]].duplicateRepresentative>0 
+		&& pos[2]<state.rewrite.L # the last layer can have different y values and should not be changed jointly
 		representative=Int(state.branches[pos[1]].duplicateRepresentative)
 		println("multiple___________________________________________change")
 		for branch=state.branches
@@ -91,14 +90,14 @@ end
 
 
 
-randmodel=randomModel(4,[5,5,5,5,2])
+randmodel=randomModel(4,[5,2])
 model=randmodel
 N=1000
 # input parameters
 Ydata=rand(Uniform(-3,3),N)
 Xdata=rand(Uniform(-3,3),randmodel.n0,N)
 
-ell=1
+ell=2
 state=TrainerState(randmodel,ell,Xdata,Ydata)
 state.gradient
 (code,state,pos)=trainL1(model,ell,Xdata,Ydata);
@@ -153,7 +152,7 @@ state.Apseudo=computeAPseudo(state) # TODO: different result, check
 println("diff before: $(coordinateDiff(state))")
 i=bestIndex(state,-state.gradient)
 
-state.negModifiedGrad=state.Apseudo[i,:]
+state.direction=state.Apseudo[i,:]
 state.Apseudo= PseudoInverseRemoveCol(state.Apseudo,i)
 removeCritical!(state,i)
 (pos,normalvec,t)=step(state)
@@ -212,7 +211,7 @@ push!(trace,(deepcopy(state),deepcopy(normalvec), loss(state)))
 state=deepcopy(trace[end][1])
 i=bestIndex(state,-state.gradient)
 if i>0
-	state.negModifiedGrad=state.Apseudo[i,:]
+	state.direction=state.Apseudo[i,:]
 	state.Apseudo= PseudoInverseRemoveCol(state.Apseudo,i)
 	removeCritical!(state,i)
 	(pos,normalvec,t)=step(state)
@@ -260,7 +259,7 @@ while size(state.critical,1) < state.rewrite.n0
 		#if pos[1]==0 then gradient is zero, 
 		#if pos[1]==-1 then function can be made arbitrarily small
 		if pos[1]==0
-			println("gradient is zero!")
+			throw("gradient is zero")
 		end
 		if pos[1]==-1
 			println("can be made arbitrary small!")
@@ -301,41 +300,29 @@ updateGradient!(state,pos[1])
 state.Apseudo=computeAPseudo(state) # TODO: different result, check
 cdiff=coordinateDiff(state)
 if cdiff>1e-8
-	println("coordinate diff: $(cdiff)")
+	@warn("coordinate diff: $(cdiff)")
 end
 adiffs=argDiffs(state)
 if length(adiffs)>0
 	adiff=maximum(abs.(adiffs))
 	if adiff>1e-8
-		println("argdiff: $(adiff)")
+		@warn "argdiff: $(adiff)"
 	end
 end
 # push!(trace,(deepcopy(state),deepcopy(normalvec), loss(state)))
 # state=deepcopy(trace[end][1])
 i=bestIndex(state,-state.gradient)
 if i>0
-	state.negModifiedGrad=state.Apseudo[i,:]
+	state.direction=state.Apseudo[i,:]
 	state.Apseudo= PseudoInverseRemoveCol(state.Apseudo,i)
 	removeCritical!(state,i)
 	(pos,normalvec,t)=step(state)
 	l=loss(state)
 	if t>0 && l[1]>prevloss[1]
-		println("Increases in value!")
+		@warn("Increase in loss value")
 		println(l)
-		return (-2,state,state.pos) #-2 = increases in function value
 	end
 	prevloss=l
-	if pos[1]<=0 
-		if pos[1]==0
-			println("gradient is zero!")
-		end
-		if pos[1]==-1
-			println("can be made arbitrary small!")
-		end
-		#if pos[1]==0 then gradient is zero, 
-		#if pos[1]==-1 then function can be made arbitrarily small
-		return (pos[1],state,state.pos) #return information code "pos[1]"
-	end
 	index=1
 	println(loss(state)[1])
 else

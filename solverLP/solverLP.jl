@@ -52,7 +52,7 @@ push!(trace,(deepcopy(state),deepcopy(normalvec), f(model,state.x)[1]))
 state=deepcopy(trace[end][1])
 i=bestIndex(state,-state.gradient)
 if i>0
-	state.negModifiedGrad=state.Apseudo[i,:]
+	state.direction=state.Apseudo[i,:]
 	state.Apseudo= PseudoInverseRemoveCol(state.Apseudo,i)
 	deleteat!(state.critical,i)
 	(pos,normalvec,t)=step(model,state)
