@@ -31,18 +31,20 @@ Provides additional properties for a `ModelRewrite` which are specific to one ob
 ```julia
 mutable struct DataBranch
     # variables that need a single copy per data point for training
-    duplicateRepresentative::Int;
-    s::Array{Array{Bool,1},1}
-    grad::Array{Float64,1}
-    critical::Array{Tuple{Int,Int},1}
-    W1::Matrix{Float64}
-    y::Array{Float64,1}
+	duplicateGroup::Int;
+	isRepresentative::Bool
+	s::Array{Array{Bool,1},1}
+	grad::Array{Float64,1}
+	critical::Array{Tuple{Int,Int},1}
+	W1::Matrix{Float64}
+	y::Array{Float64,1}
 end
 ```
 
 The struct members have the following purpose:
 
-- `duplicateRepresentative`: A value of `0` indicates that this data branch is not contained in one of the arrays of `duplicateGroups` of the corresponding `TrainerState`. Otherwise, a non-zero value corresponds to the index of the array in `duplicateGroups` where this `DataBranch` is referred to by its index in the array `branches` of the `TrainerState`.
+- `duplicateGroup`: A value of `0` indicates that this data branch is not contained in one of the arrays of `duplicateGroups` of the corresponding `TrainerState`. Otherwise, a non-zero value corresponds to the index of the array in `duplicateGroups` where this `DataBranch` is referred to by its index in the array `branches` of the `TrainerState`.
+- `isRepresentative`: Is set to `true` if this data branch has a tuple element in its `critical` array with a layer index (first element of tuple) smaller than the number `L` of layers in the `ModelRewrite`.
 - `s`: An array of boolean arrays. The indices of the outer and inner array correspond to layer number and neuron index within that layer. The boolean values specify if the corresponding neuron is active (`1`)  or inactive (`0`).
 - `grad`: The gradient currently computed for this data branch. Due structure of the L1-loss for the regression training of neural networks, the gradients `grad` of multiple `DataBranch`es can be summed up to obtain the overall gradient with respect to the arguments of the rewritten neural network, i.e. with respect to the layer `ell` weight and bias parameters of the original model.
 - `critical`: An array of tuples containing the layer index and neuron index within that layer of neurons which are currently critical (i.e. for which the algorithm has computed axis directions in the `Apseudo` matrix)
@@ -54,6 +56,7 @@ The struct members have the following purpose:
 ```julia
 mutable struct TrainerState
     duplicateGroups::Array{Array{Int,1},1}
+	criticalDuplicateGroups::Array{Bool,1}
     rewrite::ModelRewrite
     Apseudo::Array{Float64,2}
     branches::Array{DataBranch,1}
@@ -67,6 +70,7 @@ end
 The struct members have the following purpose:
 
 - `duplicateGroups`: An Array of `Int`-Arrays; each such `Int`-Array groups together branch indices which have the same transformed input data, i.e. the same matrix `W1`.
+- `criticalDuplicateGroups`: A boolean array specifying whether `critical` contains a tuple corresponding to neuron in a data branch within a duplicate group (i.e. element of `duplicateGroups`) with layer index smaller than `rewrite.L` (because in that layer the hyperplanes induced by different `DataBranch` elements in the same duplicate group can still differ because of the potentially different response variable `y`)
 - `rewrite`: A model rewrite, see above.
 - `Apseudo`: The peudo-inverse of the matrix with columns equal to the normal vectors of the hyperplanes corresponding to the critical neurons with indices in `critical` below.
 - `branches`: A vector of `DataBranch`es, one for every observation involved in the training process.

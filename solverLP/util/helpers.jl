@@ -98,7 +98,8 @@ end
 end
 mutable struct DataBranch
 	# variables that need a single copy per data point for training
-	duplicateRepresentative::Int;
+	duplicateGroup::Int;
+	isRepresentative::Bool
 	s::Array{Array{Bool,1},1}
 	grad::Array{Float64,1}
 	critical::Array{Tuple{Int,Int},1}
@@ -106,7 +107,7 @@ mutable struct DataBranch
 	y::Array{Float64,1}
 	function DataBranch(m::ModelRewrite, W1::Matrix{Float64}, y::Array{Float64,1},pos::Array{Float64,1} )
 		(s,grad)=sigGrad(m,W1,y,pos);
-		new(0,s,grad,Array{Tuple{Int,Int},1}(),W1,y)
+		new(0,false,s,grad,Array{Tuple{Int,Int},1}(),W1,y)
 	end
 end
 function tildeParameter(model::Model,ell::Int)
@@ -126,6 +127,7 @@ return pos
 end
 mutable struct TrainerState
 	duplicateGroups::Array{Array{Int,1},1}
+	criticalDuplicateGroups::Array{Bool,1}
 	rewrite::ModelRewrite
 	Apseudo::Array{Float64,2}
 	branches::Array{DataBranch,1}
@@ -146,7 +148,7 @@ mutable struct TrainerState
 		for k = 1:length(dup)
 			representative=k
 			for i = dup[k]
-				branches[i].duplicateRepresentative=representative
+				branches[i].duplicateGroup=representative
 			end
 		end
 		grad=branches[1].grad
@@ -154,7 +156,9 @@ mutable struct TrainerState
 			grad+=branches[i].grad
 		end
 		critical=Array{Tuple{Int,Int,Int},1}()
-		new(dup,modelRewrite,zeros(0,modelRewrite.n0),branches,pos,critical,grad,-grad)
+		criticalDuplicateGroups=zeros(Bool,length(dup))
+		new(dup,criticalDuplicateGroups,
+			modelRewrite,zeros(0,modelRewrite.n0),branches,pos,critical,grad,-grad)
 	end
 end
 function sortfunction(x,y)
@@ -167,74 +171,81 @@ function sortfunction(x,y)
 	end
 	return false
 end
-function advanceMax(rewrite::ModelRewrite,branch::DataBranch,pos::Array{Float64,1},v::Array{Float64,1},cap::Float64=-0.1)
-s=branch.s
-critical=deepcopy(branch.critical)
-sort!(critical,lt=sortfunction)
-criticalIdx=1;
-considerCritical=(criticalIdx<=length(critical))
-nextCriticalLayer=0;
-if considerCritical
-	nextCriticalLayer=first(critical[criticalIdx])	
+function advanceMax(rewrite::ModelRewrite,branch::DataBranch,duplicateBlock::Bool,pos::Array{Float64,1},v::Array{Float64,1},cap::Float64=-0.1)
+	s=branch.s
+	critical=deepcopy(branch.critical)
+	sort!(critical,lt=sortfunction)
+	criticalIdx=1;
+	considerCritical=(criticalIdx<=length(critical))
+	nextCriticalLayer=0;
+	if considerCritical
+		nextCriticalLayer=first(critical[criticalIdx])	
+	end
+	change=Tuple{Int,Int}((0,0))
+	α=branch.W1*pos
+	β=branch.W1*v
+	t=Inf64
+	for l = 1:rewrite.L
+		# global considerCritical, α, β, t
+		if l==rewrite.L
+			α-= branch.y
+		end
+		for j = 1:rewrite.n[l]
+			if considerCritical
+				if nextCriticalLayer==l
+					if critical[criticalIdx][2]==j
+						criticalIdx+=1
+						if criticalIdx>length(critical)
+							considerCritical=false
+						else
+							nextCriticalLayer=first(critical[criticalIdx])
+						end
+						continue;
+					end
+				end
+			end
+			if j>rewrite.nNoDuplicate[l]
+				continue;
+			end
+			if β[j]!=0
+				τ = -α[j]/β[j]
+				if (((s[l][j]==true)&&(β[j]<0))||((s[l][j]==false)&&(β[j]>0))) && τ>cap
+					if τ<t
+						if duplicateBlock==false||l==rewrite.L # only consider once for duplicates
+							t=τ
+							change=(l,j)
+						end
+					end
+				end
+			end
+		end
+		if l<rewrite.L
+			α = rewrite.W2[l]*(s[l].*α)+rewrite.c[l+1]
+			β = rewrite.W2[l]*(s[l].*β)
+		end
+	end
+	return (t,change)
 end
-change=Array{Tuple{Int,Int,Bool,Float64},1}()
-sizehint!(change,10)
-α=branch.W1*pos
-β=branch.W1*v
-t=Inf64
-for l = 1:rewrite.L
-# global considerCritical, α, β, t
-if l==rewrite.L
-	α-= branch.y
-end
-for j = 1:rewrite.n[l]
-if considerCritical
-if nextCriticalLayer==l
-if critical[criticalIdx][2]==j
-criticalIdx+=1
-if criticalIdx>length(critical)
-considerCritical=false
-else
-nextCriticalLayer=first(critical[criticalIdx])
-end
-continue;
-end
-end
-end
-if j>rewrite.nNoDuplicate[l]
-continue;
-end
-if β[j]!=0
-τ = -α[j]/β[j]
-if (((s[l][j]==true)&&(β[j]<0))||((s[l][j]==false)&&(β[j]>0))) && τ>cap
-if τ<=t+1e-10
-if τ<t-1e-10
-empty!(change)
-t=τ
-end
-push!(change,(l,j,(β[j]>0),τ))
-end
-end
-end
-end
-if l<rewrite.L
-	α = rewrite.W2[l]*(s[l].*α)+rewrite.c[l+1]
-	β = rewrite.W2[l]*(s[l].*β)
-end
-end
-return (t,change)
+function isDuplicateBlocked(state::TrainerState,branchIndex::Int)
+	branch=state.branches[branchIndex]
+	if branch.duplicateGroup>0
+		if state.criticalDuplicateGroups[branch.duplicateGroup]&& branch.isRepresentative==false
+			return true;
+		end
+	end
+	return false
 end
 function advanceMaxJoint(state::TrainerState, pos::Array{Float64,1},v::Array{Float64,1},cap::Float64=-0.1)
-branches=state.branches
+	branches=state.branches
 branches::Array{DataBranch,1}
-amax=[advanceMax(state.rewrite,branches[i],pos,v,cap) for i in 1:size(branches,1)]
+amax=[advanceMax(state.rewrite,branches[i],isDuplicateBlocked(state,i),pos,v,cap) for i in 1:size(branches,1)]
 imin=0
 ival=0.0
 t=Inf64
-change=Array{Tuple{Int,Int,Bool,Float64},1}()
+change=Tuple{Int,Int}((0,0))
 for i = 1:length(amax)
 	(tnew,changenew)=amax[i]
-	if length(last(amax[i]))>0&&t>tnew
+	if t>tnew
 		t=tnew
 		change=changenew
 		imin=i
@@ -327,6 +338,10 @@ function addCritical!(rewrite::ModelRewrite,state::TrainerState,pos::Tuple{Int,I
 	iproducts=[innerProductsOrientedNormalVectors(rewrite,branch,normalvec) for branch in state.branches]
 	criticalInnerProducts = extractCriticalInnerProducts(state.critical,iproducts)
 	state.Apseudo=PseudoInverseAddColIP(state.Apseudo,criticalInnerProducts,normalvec)
+	if branch.duplicateGroup>0
+		branch.isRepresentative=true;
+		state.criticalDuplicateGroups[branch.duplicateGroup]=true;
+	end
 	push!(state.critical,pos)
 	push!(branch.critical,(pos[2],pos[3]))
 	return normalvec
@@ -338,8 +353,8 @@ function project(rewrite::ModelRewrite, state::TrainerState,vec::Array{Float64,1
 end
 function step(state::TrainerState)
 	v=state.direction
-	if all(x->abs(x)<1e-10,v)
-		@warn("Gradient is zero")
+	if norm(v)<1e-8
+		@warn("Direction is zero")
 	end
 	rewrite=state.rewrite
 	(i,(t,change))=advanceMaxJoint(state,state.pos,v)
@@ -348,12 +363,15 @@ function step(state::TrainerState)
 	end
 	state.pos=state.pos+t*v
 	############################### add critical
-	pos = (i,change[1][1],change[1][2])
+	pos = (i,change[1],change[2])
 	normalvec = addCritical!(rewrite,state,pos)
 	if size(state.Apseudo,1)<rewrite.n0
 		############################### orthogonalize
 		v=state.direction
 		state.direction=v-project(rewrite,state,v)
+		if norm(state.direction)<1e-8
+			@warn("direction is zero")
+		end
 	else
 		state.direction=zeros(rewrite.n0)
 	end
@@ -439,9 +457,14 @@ function PseudoInverseRemoveCol(Apseudo,colId::Int)
 end
 function removeCritical!(state::TrainerState, i::Int)
 dataindex=state.critical[i][1]
-ind=findfirst(x->x==(state.critical[i][2],state.critical[i][3]), state.branches[dataindex].critical)
-deleteat!(state.branches[dataindex].critical, ind)
+branch=state.branches[dataindex]
+ind=findfirst(x->x==(state.critical[i][2],state.critical[i][3]), branch.critical)
+deleteat!(branch.critical, ind)
 deleteat!(state.critical,i)
+if branch.duplicateGroup>0
+	branch.isRepresentative=false;
+	state.criticalDuplicateGroups[branch.duplicateGroup]=false;
+end
 end
 function duplicates(outputs::Array{Array{Float64,1},1})
 D=Dict()
